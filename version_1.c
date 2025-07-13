@@ -1,86 +1,345 @@
 #include <Keypad.h>
+#include <LiquidCrystal.h>
+#include <Servo.h>
 #include <TimeLib.h>
-#include <avr/io.h>
-#include <stdint.h>
-#include <util/delay.h>
 
-#define N 0
-#define A 1
-#define B 2
-#define C 3
+// === Pin Mapping ===
+#define TRIG_PIN A4
+#define ECHO_PIN A5
+#define BUZZER_PIN 10
+#define SERVO_PIN 11
 
-void set_servo_angle(uint8_t angle);
+// === Modes ===
+#define MODE_CLOCK 0
+#define MODE_ALARM 1
+#define MODE_LOCK 2
 
+// === Keypad Setup (Rows: 9-6, Cols: 5-2) ===
 const byte ROWS = 4, COLS = 4;
-
-char keymap[ROWS][COLS] = {{'1', '2', '3', 'A'},
-                           {'4', '5', '6', 'B'},
-                           {'7', '8', '9', 'C'},
-                           {'*', '0', '#', 'D'}};
-
-byte rowPins[ROWS] = {0, 1, 2, 3};
-byte colPins[COLS] = {4, 5, 6, 7};
-
+char keys[ROWS][COLS] = {{'1', '2', '3', 'A'},
+                         {'4', '5', '6', 'B'},
+                         {'7', '8', '9', 'C'},
+                         {'*', '0', '#', 'D'}};
+byte rowPins[ROWS] = {9, 8, 7, 6};
+byte colPins[COLS] = {5, 4, 3, 2};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-int state;
+// === LCD Setup (RS=12, E=13, D4-D7 = A0-A3) ===
+LiquidCrystal lcd(12, 13, A0, A1, A2, A3);
 
-void new_state(int);
+// === State Variables ===
+Servo lockServo;
+int mode = MODE_CLOCK;
+time_t alarmTime;
+time_t lockEndTime;
+bool isLocked = false;
+bool alarmSet = false;
+bool lockSet = false;
+bool cancelled = false;
+unsigned long lastToggleTime = 0;
+bool showAlarmLine = false;
 
-int main() {
+void setup() {
   Serial.begin(9600);
 
-  setTime(12, 0, 0, 1, 1, 2025);  // Set time to 12:00:00 on Jan 1, 2025
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
 
-  // Set PB1 (pin 9) as output
-  DDRB |= (1 << DDB1);
+  lockServo.attach(SERVO_PIN);
+  lockServo.write(0);  // Unlock
 
-  // Fast PWM, Mode 14: ICR1 is TOP
-  TCCR1A = (1 << COM1A1) | (1 << WGM11);
-  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11);  // Prescaler = 8
+  lcd.begin(16, 2);
+  lcd.print("Set Time (HHMM):");
+  setTime(getTimeFromUser("Set Time"));
 
-  ICR1 = 39999;  // TOP for 20ms period (50 Hz)
+  lcd.clear();
+  lcd.print("Press A (alarm)");
+  lcd.setCursor(0, 1);
+  lcd.print("or B (lock)");
+  delay(2500);
+}
 
-  while (1) {
-    char key_in = keypad.getKey();
-
-    new_state(N);  // initial state is N
-
-    switch (state) {
-      case N:  // clock only mode
-        if (key_in == *("A")) new_state(A);
-        if (key_in == *("B")) new_state(B);
-        if (key_in == *("C")) new_state(C);
-
-        break;
-      case A:  // Clock + alarm
-
-        if (key_in == *("B")) new_state(B);
-        break;
-
-      case B:  // clock + lock
-        if (key_in == *("C")) new_state(C);
-        break;
-
-      case C:  // clock + alarm + lock
-        if (key_in == *("C")) new_state(C);
-        break;
+void loop() {
+  char key = keypad.getKey();
+  if (key == 'A') {
+    mode = MODE_ALARM;
+    handleAlarmOnly();
+    mode = MODE_CLOCK;
+  } else if (key == 'B') {
+    mode = MODE_LOCK;
+    handleLockOnly();
+    mode = MODE_CLOCK;
+  } else if (key == 'C') {
+    if (alarmSet) {
+      alarmSet = false;
+      lcd.clear();
+      lcd.print("Alarm cleared");
+    } else {
+      lcd.clear();
+      lcd.print("No alarm active");
     }
+    delay(1500);
+  }
 
-    set_servo_angle(90);  // 1 ms
-    Serial.print("OCR1A = ");
-    Serial.println(OCR1A);
+  displayStatus();
 
-    return 0;
+  // Run alarm and lock independently
+  if (alarmSet && now() >= alarmTime) {
+    triggerAlarm();
+    alarmSet = false;
+  }
+
+  if (lockSet && now() >= lockEndTime && isLocked) {
+    unlockBox();
+    lockSet = false;
+  }
+
+  delay(500);
+}
+
+// === === === === HANDLERS === === === ===
+
+void handleAlarmOnly() {
+  if (alarmSet) {
+    if (!confirmAlarmOverride(alarmTime)) return;
+  }
+
+  alarmTime = getTimeFromUser("Alarm");
+  if (cancelled) {
+    mode = MODE_CLOCK;
+    return;
+  }
+
+  alarmSet = true;
+  lcd.clear();
+  lcd.print("Alarm set for");
+  lcd.setCursor(0, 1);
+  print2Digits(hour(alarmTime));
+  lcd.print(":");
+  print2Digits(minute(alarmTime));
+  delay(2000);
+}
+
+void handleLockOnly() {
+  if (lockSet) {
+    lcd.clear();
+    lcd.print("Lock in progress");
+    delay(2000);
+    return;
+  }
+
+  int minutes = getDurationFromUser("Lock (MM)");
+  if (cancelled) {
+    mode = MODE_CLOCK;
+    return;
+  }
+
+  waitForPhone();
+  lockBox();
+  lockEndTime = now() + minutes * 60;
+  lockSet = true;
+}
+
+// === === === === UTILITIES === === === ===
+
+void waitForPhone() {
+  lcd.clear();
+  lcd.print("Place phone...");
+  while (true) {
+    long distance = getDistanceCM();
+    if (distance > 0 && distance <= 6) {
+      delay(1000);  // debounce
+      if (getDistanceCM() <= 6) break;
+    }
   }
 }
 
-void new_state(int ns) {
-  // This function transitions to a new state, and reports that new state.
-  state = ns;
-  report_state();
+void lockBox() {
+  lockServo.write(90);  // Lock
+  isLocked = true;
+  lcd.clear();
+  lcd.print("Box Locked");
+  delay(1000);
 }
 
-void set_servo_angle(uint8_t angle) {
-  OCR1A = 2000 + ((uint32_t)angle * 2000) / 180;
+void unlockBox() {
+  lockServo.write(0);  // Unlock
+  isLocked = false;
+
+  // 3 short beeps
+  for (int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, 1000);  // 1kHz beep
+    delay(150);              // on for 150 ms
+    noTone(BUZZER_PIN);
+    delay(150);  // off for 150 ms
+  }
+
+  lcd.clear();
+  lcd.print("Unlocked");
+  delay(2000);
+}
+
+void triggerAlarm() {
+  lcd.clear();
+  lcd.print("ALARM!!!");
+
+  for (int i = 0; i < 10; i++) {
+    tone(BUZZER_PIN, 1000);  // Start tone at 1kHz
+    delay(200);              // On for 200 ms
+    noTone(BUZZER_PIN);      // Stop tone
+    delay(200);              // Off for 200 ms
+  }
+}
+
+// === === === === INPUT FUNCTIONS === === === ===
+
+time_t getTimeFromUser(const char* label) {
+  lcd.clear();
+  lcd.print(label);
+  lcd.setCursor(0, 1);
+  lcd.print("HHMM: ");
+  String input = "";
+  cancelled = false;
+
+  while (input.length() < 4) {
+    char key = keypad.getKey();
+    if (key == '*') {
+      cancelled = true;
+      return 0;
+    }
+    if (key && isDigit(key)) {
+      input += key;
+      lcd.print(key);
+    }
+  }
+
+  int h = input.substring(0, 2).toInt();
+  int m = input.substring(2, 4).toInt();
+  if (h > 23 || m > 59) {
+    lcd.clear();
+    lcd.print("Invalid time");
+    delay(1500);
+    return getTimeFromUser(label);
+  }
+
+  return previousMidnight(now()) + h * SECS_PER_HOUR + m * SECS_PER_MIN;
+}
+
+int getDurationFromUser(const char* label) {
+  lcd.clear();
+  lcd.print(label);
+  lcd.setCursor(0, 1);
+  String input = "";
+  cancelled = false;
+
+  while (input.length() < 2) {
+    char key = keypad.getKey();
+    if (key == '*') {
+      cancelled = true;
+      return 0;
+    }
+    if (key && isDigit(key)) {
+      input += key;
+      lcd.print(key);
+    }
+  }
+
+  return input.toInt();
+}
+
+// === === === === STATUS DISPLAY === === === ===
+
+void displayStatus() {
+  // Line 1: current time
+  lcd.setCursor(0, 0);
+  lcd.print("Time: ");
+  print2Digits(hour());
+  lcd.print(":");
+  print2Digits(minute());
+  lcd.print("      ");
+
+  // Alternate alarm/lock display every 2 seconds
+  lcd.setCursor(0, 1);
+
+  if (alarmSet && lockSet) {
+    if (millis() - lastToggleTime > 5000) {
+      showAlarmLine = !showAlarmLine;
+      lastToggleTime = millis();
+    }
+
+    if (showAlarmLine) {
+      lcd.print("Alarm at: ");
+      print2Digits(hour(alarmTime));
+      lcd.print(":");
+      print2Digits(minute(alarmTime));
+      lcd.print(" ");
+    } else {
+      long secondsLeft = lockEndTime - now();
+      if (secondsLeft < 0) secondsLeft = 0;
+      int mins = secondsLeft / 60;
+      int secs = secondsLeft % 60;
+      lcd.print("Unlock in: ");
+      print2Digits(mins);
+      lcd.print(":");
+      print2Digits(secs);
+      lcd.print(" ");
+    }
+
+  } else if (lockSet) {
+    long secondsLeft = lockEndTime - now();
+    if (secondsLeft < 0) secondsLeft = 0;
+    int mins = secondsLeft / 60;
+    int secs = secondsLeft % 60;
+    lcd.print("Unlock in: ");
+    print2Digits(mins);
+    lcd.print(":");
+    print2Digits(secs);
+    lcd.print(" ");
+  } else if (alarmSet) {
+    lcd.print("Alarm at: ");
+    print2Digits(hour(alarmTime));
+    lcd.print(":");
+    print2Digits(minute(alarmTime));
+    lcd.print(" ");
+  } else {
+    lcd.print("Mode: Clock     ");
+  }
+}
+
+void print2Digits(int num) {
+  if (num < 10) lcd.print("0");
+  lcd.print(num);
+}
+
+long getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  return duration * 0.034 / 2;
+}
+
+bool confirmAlarmOverride(time_t alarmTime) {
+  lcd.clear();
+  lcd.print("Override alarm?");
+  lcd.setCursor(0, 1);
+  lcd.print("Set for ");
+  print2Digits(hour(alarmTime));
+  lcd.print(":");
+  print2Digits(minute(alarmTime));
+  delay(2000);
+
+  lcd.clear();
+  lcd.print("Press # to OK");
+  lcd.setCursor(0, 1);
+  lcd.print("* to cancel");
+
+  while (true) {
+    char key = keypad.getKey();
+    if (key == '#') return true;
+    if (key == '*') return false;
+  }
 }
